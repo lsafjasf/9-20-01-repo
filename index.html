@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>事务隔离与死锁检测器</title>
+<link rel="stylesheet" href="css/style.css" />
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">🗂️</span>
+    <div>
+      <h1>事务隔离与死锁检测器</h1>
+      <p>锁协议 · 隔离级别 · 等待图 · 死锁检测与预防</p>
+    </div>
+  </div>
+  <div class="top-controls">
+    <label>示例
+      <select id="exampleSelect"></select>
+    </label>
+    <label>死锁预防
+      <select id="preventionSelect">
+        <option value="none">不预防（检测+恢复）</option>
+        <option value="wait-die">wait-die（等待-死亡）</option>
+        <option value="wound-wait">wound-wait（伤害-等待）</option>
+      </select>
+    </label>
+    <label>牺牲者
+      <select id="victimSelect">
+        <option value="youngest">最年轻事务</option>
+        <option value="oldest">最老事务</option>
+        <option value="fewest">持锁最少</option>
+      </select>
+    </label>
+  </div>
+</header>
+
+<main class="layout">
+  <!-- 左列：事务与调度 -->
+  <section class="col col-left">
+    <div class="card">
+      <div class="card-head">
+        <h2>事务</h2>
+        <button id="addTxnBtn" class="btn btn-mini" title="添加事务">+ 事务</button>
+      </div>
+      <div id="txnList" class="txn-list"></div>
+    </div>
+
+    <div class="card grow">
+      <div class="card-head">
+        <h2>调度脚本（全局交错执行）</h2>
+        <span class="hint">语法：T1 w(x,10) / r(x) / commit / rollback / insert(y,5) / scan</span>
+      </div>
+      <textarea id="scheduleInput" class="schedule-input" spellcheck="false"></textarea>
+      <div class="row gap wrap">
+        <button id="rebuildBtn" class="btn">应用脚本</button>
+        <button id="stepBtn" class="btn btn-primary">下一步 ▶</button>
+        <button id="autoBtn" class="btn">自动 ⏩</button>
+        <button id="resetBtn" class="btn btn-danger">重置 ↺</button>
+        <label class="speed">速度
+          <input type="range" id="speedRange" min="150" max="2000" step="50" value="700" />
+        </label>
+      </div>
+      <div class="card sub">
+        <div class="card-head"><h3>初始数据项</h3>
+          <button id="addItemBtn" class="btn btn-mini">+ 数据项</button>
+        </div>
+        <div id="itemsEditor" class="items-editor"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 中列：图与状态 -->
+  <section class="col col-center">
+    <div id="anomalyBanner" class="anomaly-banner"></div>
+    <div class="card">
+      <div class="card-head">
+        <h2>锁等待图（Wait-For Graph）</h2>
+        <span id="wfgStatus" class="status-pill"></span>
+      </div>
+      <svg id="wfgSvg" viewBox="0 0 600 300" preserveAspectRatio="xMidYMid meet"></svg>
+      <p class="hint legend">
+        <span><i class="dot active"></i>活跃</span>
+        <span><i class="dot waiting"></i>等待</span>
+        <span><i class="dot aborted"></i>中止</span>
+        <span><i class="dot committed"></i>提交</span>
+        <span>边 Ti → Tj：Ti 等待 Tj 释放锁；红色环即为死锁</span>
+      </p>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <h2>锁表</h2>
+        <span class="hint">意向锁基于表资源 R，S/X 锁基于数据项</span>
+      </div>
+      <div class="table-wrap">
+        <table id="lockTable">
+          <thead><tr><th>资源</th><th>锁模式</th><th>持有者</th><th>等待队列</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card grow">
+      <div class="card-head"><h2>事件日志</h2>
+        <button id="clearLogBtn" class="btn btn-mini">清空</button>
+      </div>
+      <div id="eventLog" class="event-log"></div>
+    </div>
+  </section>
+
+  <!-- 右列：数据与说明 -->
+  <section class="col col-right">
+    <div class="card">
+      <div class="card-head"><h2>数据快照</h2></div>
+      <div id="itemsView" class="items-view"></div>
+      <div class="card-head"><h3>各事务读取历史</h3></div>
+      <div id="readHistory" class="read-history"></div>
+    </div>
+
+    <div class="card grow">
+      <div class="card-head">
+        <h2>锁兼容性矩阵</h2>
+        <button id="toggleMatrix" class="btn btn-mini">展开/收起</button>
+      </div>
+      <div id="compatWrap" class="table-wrap hidden">
+        <table class="matrix" id="compatTable"></table>
+      </div>
+      <div class="card-head"><h2>说明</h2></div>
+      <ul class="notes">
+        <li><b>严格 2PL</b>：事务提交/回滚前不释放 X 锁；RC 下 S 锁读完即放，RR/SER 持有 S 锁至事务结束。</li>
+        <li><b>意向锁</b>：写数据项前自动申请表级 IX，读前申请 IS；SIX = S + IX。</li>
+        <li><b>隔离级别</b>：RU 读不加锁（可读脏数据）；RC 读用瞬时 S 锁；RR 长 S 锁；SER 的 scan 加表级 S（谓词/间隙锁近似），杜绝幻读。</li>
+        <li><b>wait-die</b>：年轻者请求年老者 → 等待；年轻者请求年老者以外情况中止自己（非抢占）。</li>
+        <li><b>wound-wait</b>：年老者请求年轻者 → 抢占中止年轻者；年轻者请求年老者 → 等待。</li>
+      </ul>
+    </div>
+  </section>
+</main>
+
+<script src="js/engine.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>
