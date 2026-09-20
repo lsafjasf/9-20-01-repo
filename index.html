@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>事务隔离与死锁检测器</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">🗄️</span>
+    <div>
+      <h1>事务隔离与死锁检测器</h1>
+      <p>多粒度锁（S / X / IS / IX / SIX）· 两阶段锁协议 2PL · 四种隔离级别 · 等待图死锁检测</p>
+    </div>
+  </div>
+  <div class="controls">
+    <label>预防策略
+      <select id="policy">
+        <option value="none">无（检测+解除）</option>
+        <option value="wait-die">wait-die</option>
+        <option value="wound-wait">wound-wait</option>
+      </select>
+    </label>
+    <label class="check"><input type="checkbox" id="autoResolve" checked> 自动解除死锁</label>
+  </div>
+</header>
+
+<section class="examples">
+  <span class="examples-label">内置示例：</span>
+  <button data-ex="lostUpdate">丢失更新</button>
+  <button data-ex="dirtyRead">脏读</button>
+  <button data-ex="unrepeatable">不可重复读</button>
+  <button data-ex="phantom">幻读</button>
+  <button data-ex="deadlock">死锁</button>
+  <span id="exampleDesc" class="example-desc"></span>
+</section>
+
+<div class="layout">
+  <!-- 左：调度编辑 -->
+  <div class="col col-left">
+    <div class="card">
+      <h2>调度编辑</h2>
+      <p class="hint">语法 <code>T1:R(A)</code> · <code>T1:W(A,10)</code> · <code>T1:S</code>（范围扫描）· <code>T1:I(C,30)</code>（插入）· <code>T1:D(A)</code> · <code>T1:C</code> 提交 · <code>T1:A</code> 回滚</p>
+      <textarea id="scheduleText" rows="5" spellcheck="false"></textarea>
+      <div class="row">
+        <button id="applySchedule" class="primary">应用并重置</button>
+        <button id="stepBtn">单步执行 ▶</button>
+        <button id="runBtn">自动运行 ⏩</button>
+        <button id="resetBtn">重置 ↺</button>
+      </div>
+      <div class="row">
+        <span class="hint">步骤：<b id="stepNo">0</b></span>
+        <span id="runStatus" class="status-pill"></span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>手动构造操作</h2>
+      <div class="builder">
+        <label>事务
+          <select id="bTxn"></select>
+        </label>
+        <label>操作
+          <select id="bAct">
+            <option value="read">R 读</option>
+            <option value="write">W 写</option>
+            <option value="scan">S 范围扫描</option>
+            <option value="insert">I 插入</option>
+            <option value="delete">D 删除</option>
+            <option value="commit">C 提交</option>
+            <option value="rollback">A 回滚</option>
+          </select>
+        </label>
+        <label id="bItemWrap">数据项
+          <select id="bItem"></select>
+        </label>
+        <label id="bValueWrap">值
+          <input type="text" id="bValue" placeholder="新值">
+        </label>
+        <button id="bAdd">追加到调度</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>场景定义</h2>
+      <div class="setup-grid">
+        <div>
+          <h3>事务（默认隔离级别）
+            <select id="defIso" class="mini">
+              <option value="RU">RU</option>
+              <option value="RC" selected>RC</option>
+              <option value="RR">RR</option>
+              <option value="SER">SER</option>
+            </select>
+          </h3>
+          <div class="addline">
+            <input type="text" id="newTxnId" placeholder="如 T3" maxlength="6">
+            <button id="addTxnBtn">＋事务</button>
+          </div>
+          <div id="txnSetupList" class="setup-list"></div>
+        </div>
+        <div>
+          <h3>数据项（初始值）</h3>
+          <div class="addline">
+            <input type="text" id="newItemName" placeholder="名称 如 C" maxlength="6">
+            <input type="text" id="newItemValue" placeholder="初始值">
+            <button id="addItemBtn">＋数据项</button>
+          </div>
+          <div id="itemSetupList" class="setup-list"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 中：锁层次 + 等待图 -->
+  <div class="col col-mid">
+    <div class="card">
+      <h2>锁等待图（Wait-For Graph）</h2>
+      <div id="graphWrap" class="graph-wrap">
+        <svg id="wfg" viewBox="0 0 420 300" preserveAspectRatio="xMidYMid meet"></svg>
+      </div>
+      <p class="hint" id="graphHint">等待事务 → 持锁事务；<b style="color:#ff6b6b">红色边</b>构成死锁循环。</p>
+    </div>
+    <div class="card">
+      <h2>多粒度锁层次</h2>
+      <div id="lockTree" class="lock-tree"></div>
+      <div class="legend">
+        <span><i class="lm IS">IS</i>意向共享</span>
+        <span><i class="lm IX">IX</i>意向排他</span>
+        <span><i class="lm S">S</i>共享</span>
+        <span><i class="lm SIX">SIX</i>共享+意向排他</span>
+        <span><i class="lm X">X</i>排他</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- 右：事务/数据/日志 -->
+  <div class="col col-right">
+    <div class="card">
+      <h2>异常检测面板</h2>
+      <div id="anomalyPanel" class="anomaly-panel"></div>
+    </div>
+    <div class="card">
+      <h2>事务状态</h2>
+      <div id="txnList" class="txn-list"></div>
+    </div>
+    <div class="card">
+      <h2>数据项</h2>
+      <div id="dataList" class="data-list"></div>
+    </div>
+    <div class="card grow">
+      <h2>执行日志</h2>
+      <div id="logList" class="log-list"></div>
+    </div>
+  </div>
+</div>
+
+<script src="engine.js"></script>
+<script src="app.js"></script>
+</body>
+</html>
