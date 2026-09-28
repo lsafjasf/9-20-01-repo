@@ -43,7 +43,7 @@
       this.lockTable = {};
       this.lockTable[TABLE] = { holders: new Map(), queue: [] };
       this.steps = [];
-      this.cursor = 0;
+      this.done = new Set();
       this.events = [];
       this.anomalies = [];
       this.anomalyKeys = new Set();
@@ -86,8 +86,18 @@
       if (t && t.state === 'active' && !t.waiting) t.iso = iso;
     }
 
-    setSteps(steps) { this.steps = steps; this.cursor = 0; }
-    remainingSteps() { return this.steps.length - this.cursor; }
+    setSteps(steps) { this.steps = steps; this.done = new Set(); }
+    remainingSteps() { return this.steps.length - this.done.size; }
+
+    // 第一个未执行且事务处于 active 的步骤下标; 没有可执行步骤时返回 -1
+    nextRunnableIndex() {
+      for (let i = 0; i < this.steps.length; i++) {
+        if (this.done.has(i)) continue;
+        const t = this.txns.get(this.steps[i].tid);
+        if (t && t.state === 'active') return i;
+      }
+      return -1;
+    }
 
     /* ---------- 锁管理 ---------- */
     resource(res) {
@@ -500,31 +510,36 @@
     stepState(step, index) {
       const t = this.txns.get(step.tid);
       if (!t) return 'pending';
-      if (index < this.cursor) return 'done';
-      if (index === this.cursor) return 'current';
+      if (this.done.has(index)) return 'done';
       if (t.state === 'aborted' || t.state === 'committed') return 'skipped';
+      if (index === this.nextRunnableIndex()) return 'current';
       return 'pending';
     }
 
     runNextStep() {
-      while (this.cursor < this.steps.length) {
-        const step = this.steps[this.cursor];
+      // 跳过等待中的事务, 在后续步骤里寻找仍可执行的事务(例如持锁方 commit);
+      // commit/rollback 触发 releaseAll -> pump 后, 等待事务会重新回到 active,
+      // 下一次调用自然能执行它之前被跳过的步骤。
+      for (let i = 0; i < this.steps.length; i++) {
+        if (this.done.has(i)) continue;
+        const step = this.steps[i];
         const t = this.txns.get(step.tid);
         if (t && t.ts === 0) t.ts = this.nextSeq(); // 首次执行即“开始”, 决定年龄
-        if (!t || t.state === 'aborted' || t.state === 'committed') { this.cursor++; continue; }
+        if (!t || t.state === 'aborted' || t.state === 'committed') { this.done.add(i); continue; }
         if (t.state === 'waiting') {
-          return { status: 'blocked', message: step.tid + ' 正在等待锁' };
+          continue; // 暂时阻塞: 保留该步骤, 先推进其他事务
         }
-        this.cursor++;
+        this.done.add(i);
         const res = this.runOp(step.tid, step.op);
         if (res && res.error) this.log('info', '✗ 跳过: ' + step.text + ' (' + res.error + ')');
         const wfg = this.detectDeadlock();
         const waiting = Array.from(this.txns.values()).some(x => x.state === 'waiting');
-        if (this.cursor >= this.steps.length && !waiting) this.finished = true;
+        if (this.remainingSteps() === 0 && !waiting) this.finished = true;
         return { status: 'ran', step, wfg };
       }
-      this.finished = !Array.from(this.txns.values()).some(x => x.state === 'waiting');
-      return { status: this.finished ? 'done' : 'blocked' };
+      const waiters = Array.from(this.txns.values()).filter(x => x.state === 'waiting');
+      this.finished = waiters.length === 0;
+      return { status: this.finished ? 'done' : 'blocked', waiters };
     }
   }
 

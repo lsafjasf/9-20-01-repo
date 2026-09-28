@@ -167,7 +167,15 @@ T2 commit`
     const r = engine.runNextStep();
     renderAll();
     if (r.status === 'blocked') {
-      engine.log('info', '所有可执行事务都在等待锁 — 死锁已被解除前无法继续, 请重置或切换策略');
+      const waits = (r.waiters || []).map(t => {
+        const w = t.waiting || {};
+        const blockers = engine.conflicts(w.resource, w.mode, t.id).map(c => c.tid);
+        return t.id + ' 等待 ' + w.resource + ' 的 ' + w.mode + ' 锁' +
+          (blockers.length ? ' (被 ' + blockers.join(', ') + ' 阻塞)' : '');
+      });
+      engine.log('info', '⏸ 调度停滞: 剩余步骤都属于等待中的事务' +
+        (waits.length ? ' — ' + waits.join('; ') : '') +
+        '; 持锁方已没有可执行的后续操作来释放锁, 请检查调度(是否缺少 commit/rollback)或重置');
       renderLog();
       stopAuto();
     }
@@ -446,11 +454,9 @@ T2 commit`
 
   function renderAll() {
     renderTxns(); renderLocks(); renderItems(); renderWfg(); renderBanner(); renderLog();
-    // 有剩余调度步骤即可继续: 引擎会自动跳过阻塞事务, 推进其他事务直至全部阻塞
-    const noSteps = engine && engine.remainingSteps() === 0;
-    const allBlocked = engine && noSteps &&
-      Array.from(engine.txns.values()).some(t => t.state === 'waiting');
-    el.stepBtn.disabled = !engine || (noSteps && (engine.finished || allBlocked));
+    // 存在未执行且事务处于 active 的步骤即可继续:
+    // 引擎会自动跳过阻塞事务, 推进其他事务, 直至它们全部阻塞
+    el.stepBtn.disabled = !engine || engine.finished || engine.nextRunnableIndex() < 0;
   }
 
   /* ---------- 兼容矩阵 ---------- */
