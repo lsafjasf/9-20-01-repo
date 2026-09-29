@@ -61,9 +61,12 @@
       anomalies: { lostUpdate: [], dirtyRead: [], unrepeatable: [], phantom: [], deadlock: [] },
       policy: setup.policy || 'none',
       autoResolve: setup.autoResolve !== false,
+      timeoutSteps: setup.timeoutSteps || 3,
       stepNo: 0,
       seqCounter: 1,
-      readyQueue: []
+      readyQueue: [],
+      execCount: {},   // 每事务已执行操作数（统计用，不影响调度逻辑）
+      aborts: []       // 中止事件流水 {tid, reason, step}（统计用）
     };
 
     (setup.items || []).forEach(function (it) {
@@ -79,6 +82,7 @@
       state.txns[id] = {
         id: id, iso: ISO[iso] ? iso : 'RC', status: 'active',
         ts: state.seqCounter++, locks: {}, waitsOn: [], blockedSeq: null,
+        waitStart: null,
         pending: null, reads: {}, readValue: {}, scans: []
       };
       return state.txns[id];
@@ -133,6 +137,7 @@
       const t = state.txns[tid];
       if (t.waitsOn.indexOf(res) < 0) t.waitsOn.push(res);
       if (t.blockedSeq == null) t.blockedSeq = state.seqCounter++;
+      if (t.waitStart == null) t.waitStart = state.stepNo; // 记录开始等待的步号（timeout 策略用）
     }
 
     // 死锁预防：返回 true 表示请求者应当被中止
@@ -184,11 +189,13 @@
       });
       state.txns[tid].locks = {};
       state.txns[tid].waitsOn = [];
+      state.txns[tid].waitStart = null;
     }
 
     function abortTxn(tid, reason) {
       const t = state.txns[tid];
       if (!t || t.status !== 'active') return;
+      state.aborts.push({ tid: tid, reason: reason || 'abort', step: state.stepNo });
       purgeQueue(tid);
       Object.keys(state.items).forEach(function (name) {
         if (t.locks['I:' + name]) state.items[name].draft = null;
@@ -198,6 +205,7 @@
       t.waitsOn = [];
       releaseAllLocks(tid);
       const why = reason === 'died' ? '（wait-die：遇到更老事务，自己中止）'
+        : reason === 'timeout' ? '（timeout：等待超过 ' + state.timeoutSteps + ' 步，超时中止）'
         : reason === 'wounded' ? '' : '';
       log('abort', '事务 ' + tid + ' 中止回滚 ROLLBACK' + why, 'abort', [tid]);
       wake();
@@ -220,7 +228,7 @@
             }
             e.queue.shift();
             t.waitsOn = t.waitsOn.filter(function (r) { return r !== res; });
-            if (t.waitsOn.length === 0) t.blockedSeq = null;
+            if (t.waitsOn.length === 0) { t.blockedSeq = null; t.waitStart = null; }
             grant(res, w.tid, w.mode);
             progress = true;
             // 锁已授予；该事务的阻塞操作仍在全局 readyQueue 队首，下一轮 step 自动重试
@@ -238,12 +246,24 @@
       wake();
       const before = state.log.length;
 
+      // 超时中止策略：等待时长超过阈值的事务中止回滚（也借此解开死锁）
+      if (state.policy === 'timeout') {
+        let victim = null;
+        state.txnOrder.forEach(function (id) {
+          const t = state.txns[id];
+          if (t.status !== 'active' || !t.waitsOn.length || t.waitStart == null) return;
+          if (state.stepNo - t.waitStart < state.timeoutSteps) return;
+          if (!victim || t.waitStart < state.txns[victim].waitStart) victim = id;
+        });
+        if (victim) { abortTxn(victim, 'timeout'); wake(); }
+      }
+
       const d = detectDeadlock();
       if (d.cycle.length) {
         const ids = d.cycle;
         markAnomaly('deadlock',
           '检测到死锁循环：' + ids.join(' → ') + ' → ' + ids[0] + '（等待图中存在环）', ids);
-        if (state.autoResolve) {
+        if (state.autoResolve && state.policy !== 'timeout') {
           const victim = d.victim;
           log('abort', '选择时间戳最新（最年轻）的事务 ' + victim + ' 作为牺牲者，解除死锁', 'abort', [victim]);
           if (state.readyQueue.length && state.readyQueue[0].tid === victim) state.readyQueue.shift();
@@ -275,6 +295,7 @@
         state.readyQueue.shift();
         const r = execute(head.tid, head.op);
         if (r === 'wait') { seenWaiting[head.tid] = true; state.readyQueue.push(head); continue; }
+        if (r !== 'dead') state.execCount[head.tid] = (state.execCount[head.tid] || 0) + 1;
         return { status: 'ok', added: state.log.length - before };
       }
       return { status: state.readyQueue.length ? 'blocked' : 'finished', added: state.log.length - before };
@@ -283,7 +304,7 @@
     function purgeQueue(tid) {
       state.readyQueue = state.readyQueue.filter(function (q) { return q.tid !== tid; });
       const t = state.txns[tid];
-      if (t) { t.pending = null; t.waitsOn = []; }
+      if (t) { t.pending = null; t.waitsOn = []; t.waitStart = null; }
     }
 
     // ---------- 读值可见性 ----------
@@ -552,6 +573,10 @@
         if (r.status === 'deadlock' && !state.autoResolve) break;
         if (r.status === 'blocked' && r.added === 0) {
           // 无预防策略且未自动解除：死锁会被上面的环检测捕获；这里兜底
+          if (state.policy === 'timeout' && state.txnOrder.some(function (id) {
+            const t = state.txns[id];
+            return t.status === 'active' && t.waitsOn.length;
+          })) continue; // timeout 策略下仍有等待者，继续推进步号以触发超时
           break;
         }
       }
@@ -615,6 +640,106 @@
       sch.state.readyQueue.push({ tid: op.tid, op: copy });
     });
     return sch;
+  }
+
+  // ---------- 死锁处理策略对比 ----------
+  // 同一组操作在指定策略下完整运行一遍；被策略中止的事务自动重启
+  // （保留原时间戳，剩余操作追加到就绪队列尾部），统计代价指标。
+  const POLICY_LABEL = {
+    'wait-die': 'wait-die（预防：年老等、年轻死）',
+    'wound-wait': 'wound-wait（预防：年老伤害年轻）',
+    'timeout': 'timeout（超时中止）'
+  };
+
+  function runPolicyScenario(setup, ops, policy, opts) {
+    opts = opts || {};
+    const maxRestarts = opts.maxRestarts != null ? opts.maxRestarts : 8;
+    const starveAfter = opts.starveAfter || 3;
+    const sch = buildScheduler({
+      txns: setup.txns, items: setup.items, defaultIso: setup.defaultIso,
+      policy: policy, autoResolve: true,
+      timeoutSteps: opts.timeoutSteps || setup.timeoutSteps || 3
+    }, ops);
+    const st = sch.state;
+    const opMap = {};
+    ops.forEach(function (op) { (opMap[op.tid] = opMap[op.tid] || []).push(op); });
+
+    const restarts = {};
+    let totalWait = 0;          // 总等待时长（事务·步）：每步处于等待状态的事务数之和
+    let consumedAborts = 0, steps = 0, stall = 0, lastLogLen = 0, finished = false;
+    const cap = opts.maxSteps || 400;
+
+    while (steps++ < cap) {
+      if (!st.readyQueue.length) { finished = true; break; }
+      sch.step();
+      st.txnOrder.forEach(function (id) {
+        const t = st.txns[id];
+        if (t.status === 'active' && t.waitsOn.length) totalWait++;
+      });
+      // 处理新发生的中止：重启仍有剩余操作的事务
+      for (; consumedAborts < st.aborts.length; consumedAborts++) {
+        const ab = st.aborts[consumedAborts];
+        if (ab.reason === 'rollback') continue; // 调度文本里的显式回滚不重启
+        const remaining = (opMap[ab.tid] || []).slice(st.execCount[ab.tid] || 0);
+        if (!remaining.length) continue;
+        restarts[ab.tid] = (restarts[ab.tid] || 0) + 1;
+        if (restarts[ab.tid] > maxRestarts) continue; // 放弃重启 -> 记为饥饿
+        const t = st.txns[ab.tid];
+        t.status = 'active'; t.pending = null; t.waitsOn = []; t.waitStart = null; // 保留原 ts
+        remaining.forEach(function (op) {
+          const copy = {};
+          Object.keys(op).forEach(function (k) { if (k !== 'tid') copy[k] = op[k]; });
+          st.readyQueue.push({ tid: ab.tid, op: copy });
+        });
+      }
+      if (st.log.length === lastLogLen && st.aborts.length <= consumedAborts) {
+        if (++stall >= 20) break; // 长时间无进展，防止死循环
+      } else { stall = 0; lastLogLen = st.log.length; }
+    }
+
+    const victims = {};
+    let rollbacks = 0;
+    st.aborts.forEach(function (ab) {
+      if (ab.reason === 'rollback') return;
+      victims[ab.tid] = (victims[ab.tid] || 0) + 1;
+      rollbacks++;
+    });
+    // 完成判定：已提交或显式回滚的事务视为完结（提交后被越过的剩余操作按引擎语义丢弃）；
+    // 其余事务若有操作未执行（仍在运行或被放弃重启），视为未完成。
+    const rolledBack = {};
+    st.aborts.forEach(function (ab) { if (ab.reason === 'rollback') rolledBack[ab.tid] = true; });
+    const incomplete = Object.keys(opMap).filter(function (id) {
+      if (rolledBack[id]) return false;
+      if ((st.execCount[id] || 0) >= opMap[id].length) return false;
+      return st.txns[id].status !== 'committed';
+    });
+    finished = finished && incomplete.length === 0;
+    const starved = Object.keys(restarts).filter(function (id) {
+      return restarts[id] >= starveAfter;
+    });
+    return {
+      policy: policy,
+      label: POLICY_LABEL[policy] || policy,
+      finished: finished,
+      steps: st.stepNo,
+      totalWait: totalWait,
+      rollbacks: rollbacks,
+      victims: victims,
+      restarts: restarts,
+      starvation: {
+        detected: starved.length > 0 || !finished,
+        txns: starved,
+        reason: starved.length ? starved.join('、') + ' 被反复中止重启（≥' + starveAfter + ' 次）'
+          : (!finished ? '调度未完成' + (incomplete.length ? '：' + incomplete.join('、') + ' 有操作未执行' : '') : '')
+      }
+    };
+  }
+
+  // 同一组操作在三种死锁处理策略下各跑一遍，返回对比结果数组
+  function comparePolicies(setup, ops, opts) {
+    return ['wait-die', 'wound-wait', 'timeout'].map(function (p) {
+      return runPolicyScenario(setup, ops, p, opts);
+    });
   }
 
   // ---------- 内置五类教学示例 ----------
@@ -685,6 +810,9 @@
     createScheduler: createScheduler,
     parseSchedule: parseSchedule,
     buildScheduler: buildScheduler,
+    runPolicyScenario: runPolicyScenario,
+    comparePolicies: comparePolicies,
+    POLICY_LABEL: POLICY_LABEL,
     EXAMPLES: EXAMPLES,
     ANOMALY_LABEL: ANOMALY_LABEL,
     resourceLabel: resourceLabel

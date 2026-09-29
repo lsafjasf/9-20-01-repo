@@ -21,7 +21,11 @@
         <option value="none">无（检测+解除）</option>
         <option value="wait-die">wait-die</option>
         <option value="wound-wait">wound-wait</option>
+        <option value="timeout">timeout（超时中止）</option>
       </select>
+    </label>
+    <label>超时阈值
+      <input type="text" id="timeoutSteps" value="3" style="width:40px" title="timeout 策略：等待超过该步数即中止">
     </label>
     <label class="check"><input type="checkbox" id="autoResolve" checked> 自动解除死锁</label>
   </div>
@@ -156,6 +160,20 @@
     </div>
   </div>
 </div>
+
+<section class="compare-section">
+  <div class="card">
+    <h2>死锁处理策略对比面板</h2>
+    <p class="hint">把当前调度在 <b>wait-die</b> / <b>wound-wait</b> / <b>timeout</b> 三种策略下各完整运行一遍；
+      被策略中止的事务自动重启（保留原时间戳，剩余操作排到队尾）。
+      命令行可用 <code>node compare.js</code> 重算同一组指标。</p>
+    <div class="row">
+      <button id="compareBtn" class="primary">对当前调度运行三策略对比 ⚖</button>
+      <span id="compareStatus" class="hint"></span>
+    </div>
+    <div id="compareResult"></div>
+  </div>
+</section>
 
 <script src="engine.js"></script>
 <script src="app.js"></script>

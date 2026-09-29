@@ -24,6 +24,7 @@
       items: setup.items.map(function (i) { return { name: i.name, value: i.value }; }),
       policy: $('policy').value,
       autoResolve: $('autoResolve').checked,
+      timeoutSteps: parseInt($('timeoutSteps').value, 10) || 3,
       defaultIso: setup.defaultIso
     };
   }
@@ -345,7 +346,63 @@
   $('resetBtn').addEventListener('click', function () { stopAuto(); resetCurrent(); });
   $('policy').addEventListener('change', function () { stopAuto(); resetCurrent(); });
   $('autoResolve').addEventListener('change', function () { stopAuto(); resetCurrent(); });
+  $('timeoutSteps').addEventListener('change', function () { stopAuto(); resetCurrent(); });
   $('bAct').addEventListener('change', refreshBuilderVisibility);
+
+  // ---------- 策略对比面板 ----------
+  function fmtDist(obj) {
+    const keys = Object.keys(obj);
+    if (!keys.length) return '<span style="color:var(--muted)">无</span>';
+    return keys.map(function (k) {
+      return '<span class="victim-chip">' + esc(k) + ' ×' + obj[k] + '</span>';
+    }).join(' ');
+  }
+
+  function renderCompare(results) {
+    const rows = [
+      ['总等待时长（事务·步）', function (r) { return '<b>' + r.totalWait + '</b>'; }],
+      ['回滚次数', function (r) { return '<b>' + r.rollbacks + '</b>'; }],
+      ['牺牲者分布', function (r) { return fmtDist(r.victims); }],
+      ['重启次数分布', function (r) { return fmtDist(r.restarts); }],
+      ['是否出现饥饿', function (r) {
+        return r.starvation.detected
+          ? '<span class="cmp-bad">是</span> <span class="cmp-note">' + esc(r.starvation.reason) + '</span>'
+          : '<span class="cmp-ok">否</span>';
+      }],
+      ['调度是否完成', function (r) {
+        return r.finished ? '<span class="cmp-ok">是</span>' : '<span class="cmp-bad">否</span>';
+      }],
+      ['总步数', function (r) { return r.steps; }]
+    ];
+    let html = '<table class="cmp-table"><thead><tr><th>指标 \\ 策略</th>' +
+      results.map(function (r) { return '<th>' + esc(r.policy) + '</th>'; }).join('') +
+      '</tr></thead><tbody>';
+    rows.forEach(function (row) {
+      html += '<tr><td>' + row[0] + '</td>' +
+        results.map(function (r) { return '<td>' + row[1](r) + '</td>'; }).join('') + '</tr>';
+    });
+    html += '</tbody></table>';
+    $('compareResult').innerHTML = html;
+    $('compareStatus').textContent = '已完成：同一调度 × 3 策略（timeout 阈值 ' +
+      (parseInt($('timeoutSteps').value, 10) || 3) + ' 步）';
+  }
+
+  $('compareBtn').addEventListener('click', function () {
+    stopAuto();
+    const text = $('scheduleText').value;
+    const parsed = DB.parseSchedule(text, setup.defaultIso);
+    if (!parsed.ops.length) {
+      $('compareStatus').textContent = '调度为空，请先输入或载入示例';
+      return;
+    }
+    const cs = currentSetup();
+    parsed.txnIds.forEach(function (id) {
+      if (!cs.txns.some(function (t) { return t.id === id; })) {
+        cs.txns.push({ id: id, iso: setup.defaultIso });
+      }
+    });
+    renderCompare(DB.comparePolicies(cs, parsed.ops, { timeoutSteps: cs.timeoutSteps }));
+  });
 
   $('addTxnBtn').addEventListener('click', function () {
     let id = $('newTxnId').value.trim().toUpperCase();
